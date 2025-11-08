@@ -1,14 +1,16 @@
 # simple tests
 import unittest
+from tinygrad.uop import Ops
 import torch
 import numpy as np
+from extra.torch_backend.backend import unwrap
 from tinygrad.helpers import getenv, Context, GlobalCounters
 if getenv("TINY_BACKEND2"):
-  import extra.torch_backend.backend2
-  device = "cpu"
+    import extra.torch_backend.backend2
+    device = "cpu"
 else:
-  import extra.torch_backend.backend
-  device = "tiny"
+    import extra.torch_backend.backend
+    device = "tiny"
 
 class TestTorchBackend(unittest.TestCase):
   def test_randperm_generator_out(self):
@@ -70,6 +72,13 @@ class TestTorchBackend(unittest.TestCase):
     a = a.as_strided((1,1,10,5), (0,0,7,1), storage_offset=0)
     a = a.as_strided((1,1,5,5), (50,50,7,1), storage_offset=21)
     np.testing.assert_equal(a.cpu().numpy().sum(-1), [[[115,150,185,220,255]]])
+
+  def test_as_strided_uop(self):
+    a = torch.arange(70, device=device).reshape(1,1,10,7)
+    v = a.as_strided((1,1,10,5), (0,0,7,1), storage_offset=0)
+    vt = unwrap(v)
+    self.assertEqual(vt.uop.op, Ops.AS_STRIDED)
+    # self.assertEqual(vt.uop.arg, ((1,1,10,5), (0,0,7,1), 0))
 
   def test_plus_inplace(self):
     a = torch.ones(4, device=device)

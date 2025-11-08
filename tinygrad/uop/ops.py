@@ -265,6 +265,14 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
           if not isinstance(axis_arg, tuple) or not all(isinstance(x, int) and x>=0 and x<len(ps) for x in axis_arg):
             raise ValueError(f"invalid type for axis: {axis_arg}")
           return tuple(1 if i in axis_arg else s for i,s in enumerate(ps))
+        case Ops.AS_STRIDED:
+            if not isinstance(self.arg.size, tuple) or not isinstance(self.arg.stride, tuple):
+                raise ValueError(f"as_strided expects tuple args, got {self.arg}")
+            if len(self.arg.size) != len(self.arg.stride):
+                raise ValueError(f"as_strided size and stride must have same length: {self.arg.size} vs {self.arg.stride}")
+            if any(x < 0 for x in self.arg.size):
+                raise ValueError(f"as_strided invalid size {self.arg.size}")
+            return self.arg.size
 
     # elementwise ops keep the shape the same. all inputs with shape must match
     if self.op in (GroupOp.Elementwise-{Ops.BITCAST}).union({Ops.COPY, Ops.ASSIGN, Ops.NOOP, Ops.GROUP, Ops.SINK, Ops.ALLREDUCE}):
@@ -533,6 +541,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       case Ops.RESHAPE | Ops.EXPAND: src_args = [arg]
       case Ops.PAD | Ops.SHRINK: src_args = list(zip(*arg))
       case Ops.PERMUTE | Ops.FLIP: src_args = []
+      case Ops.AS_STRIDED: src_args = [arg.size, arg.stride]
       case _: raise RuntimeError(f"{op} is not a MovementOp")
     usrcs = []
     for arg in src_args:
