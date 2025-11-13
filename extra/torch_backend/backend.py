@@ -56,23 +56,34 @@ view_ops = {
   "aten.expand": Tensor.expand,
   "aten.t": Tensor.transpose,
   "aten.transpose.int": Tensor.transpose,
+  "aten.squeeze": lambda self: self.squeeze(),
   "aten.squeeze.dim": Tensor.squeeze,
   "aten.unsqueeze": Tensor.unsqueeze,
   "aten.detach": Tensor.detach,
   "aten.select.int": lambda self, dim, idx: self[(slice(None),) * (dim%self.ndim) + (idx,)],
+  "aten.permute": Tensor.permute,
 }
 
 for k,v in view_ops.items(): torch.library.impl(k.replace("aten.", "aten::"), "privateuseone")(wrap_view_op(v))
 
 # in place operations with views
-def realize_with_views(self: Tensor, views: Tensor):
-  if not self.uop.st.contiguous: self.replace(self.contiguous())
-  self.replace(self.clone().realize())
+def realize_with_views(self: Tensor, views):
+  base = self.contiguous() if not self.uop.is_contiguous else self
+  base = base.clone().realize()
+  self.replace(base)
+
+  # rebuild each derived view by replaying its movement ops onto the realized base
   for v in views:
-    if v.uop.base.op is Ops.BUFFER_VIEW: continue # skip subbuffer, we just use the real buffer view
+    # skip raw subbuffer shells; they just re-wrap the realized base
+    if getattr(v.uop, "base", None) is not None and v.uop.base.op is Ops.BUFFER_VIEW:
+      continue
     ret = self
-    st = ShapeTracker(self.uop.st.views + v.uop.st.views) # TODO: is this right?
-    for mo in cached_to_movement_ops(self.shape, st): ret = apply_mop(ret, mo)
+    st = getattr(v.uop, "st", None)
+    if st is not None:
+      for mop, arg in cached_to_movement_ops(self.shape, st):
+        ret = ret._mop(mop, arg)
+    else:
+      ret = v.contiguous().clone().realize()
     v.replace(ret)
 def maybe_realize_storage(self: Tensor) -> bool:
   if realize:=is_view(self): realize_with_views((base:=canonical_base(self)), derived_views(base))
@@ -173,20 +184,38 @@ def cached_to_movement_ops(shape, st) -> list:
   if mops[0] == (MovementOps.RESHAPE, shape): mops = mops[1:]
   return mops
 
-from tinygrad.shape.shapetracker import ShapeTracker, View
-from extra.to_movement_ops import to_movement_ops, apply_mop, MovementOps
+# # Not sure if needed yet
+from extra.to_movement_ops import to_movement_ops, MovementOps
 
 @wrap_view_op
-def _as_strided(tensor:Tensor, size, stride, storage_offset=None):
-  # multiple as_strided do not compound
+def _as_strided(tensor: Tensor, size, stride, storage_offset=None):
+  # do not compound; always attach to the base view
   base = canonical_base(tensor)
-  # TODO: this is heavyweight
-  st = ShapeTracker(base.uop.st.views + (View.create(tuple(size), tuple(stride), storage_offset),))
-  ret = base
-  if TORCH_DEBUG >= 1: print("**** as_strided", tensor.shape, size, stride, st)
-  if prod(size) == 1: return ret.flatten()[storage_offset].reshape(size)
-  for mo in cached_to_movement_ops(tuple(base.shape), st): ret = apply_mop(ret, mo)
-  return ret
+  size = tuple(int(x) for x in size)
+  stride = tuple(int(x) for x in stride)
+  off = int(storage_offset or 0)
+
+  # Build linear indices idx = off + Σ_i coord_i * stride_i, broadcast across `size`
+  nd  = len(size)
+  idx = None
+  for d, (sd, st) in enumerate(zip(size, stride)):
+    # trivial axis: coord is 0 everywhere
+    if sd == 1: coord = Tensor.zeros(*size, dtype=dtypes.int, device=base.device)
+    else:
+      ar = Tensor.arange(sd, dtype=dtypes.int, device=base.device)
+      shp = (1,)*d + (sd,) + (1,)*(nd-d-1)
+      coord = ar.reshape(shp).expand(*size)
+    term = coord * int(st)
+    idx = term if idx is None else (idx + term)
+  if idx is None:
+    idx = Tensor.zeros(1, dtype=dtypes.int, device=base.device)
+  idx = idx + off
+
+  # Gather from a flattened base into the requested strided view
+  base_flat = base.reshape((prod(base.shape),))
+  out = base_flat.gather(0, idx.reshape((prod(size),))).reshape(size)
+  if TORCH_DEBUG >= 1: print("**** as_strided", tuple(tensor.shape), size, stride, off)
+  return out
 
 @torch.library.impl("aten::as_strided", "privateuseone")
 def as_strided(tensor:torch.Tensor, size, stride, storage_offset=None):
@@ -329,7 +358,7 @@ def _copy_from(src: torch.Tensor, dest, non_blocking=False):
     to_device = _from_torch_device(dest.device)
     src,dest = unwrap(src),unwrap(dest)
     # TODO we need to properly match dest shape and strides, not blindly assign
-    if dest.uop.st.contiguous or dest.uop.is_realized: src = src.contiguous() # this only solves some cases
+    if dest.uop.is_contiguous or dest.uop.is_realized: src = src.contiguous() # this only solves some cases
     dest.assign(src.cast(cast_dtype).to(to_device))
     if realize: Tensor.realize(dest)
   elif src.is_tiny and dest.is_cpu:
@@ -601,7 +630,7 @@ tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
   "aten.unfold": Tensor.unfold,
 }}
 
-def wrap_fxn(k,f):
+def wrap_fxn(k, f):
   def nf(*args, **kwargs):
     if TORCH_DEBUG:
       print(k, len(args), [x.shape if isinstance(x, torch.Tensor) else x for x in args],
